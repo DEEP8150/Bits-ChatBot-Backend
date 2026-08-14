@@ -5,7 +5,7 @@ const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 const DEFAULT_MIN_SIMILARITY = 0.32;
 const TITLE_BOOST = 0.08;
 const SITE_BOOST = 0.03;
-const MAX_FROM_SOURCE = 2;
+const MAX_FROM_SOURCE = 4;
 let embedderPromise;
 
 async function getEmbedder() {
