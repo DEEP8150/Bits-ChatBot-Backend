@@ -10,8 +10,8 @@ export const SITES = [
   { start: "https://admissions.bits-pilani.ac.in/index.html", label: "Admissions" },
 ];
 
-export const MAX_PAGES_PER_SITE = 40;
-export const MAX_DEPTH = 2;
+export const MAX_PAGES_PER_SITE = 500;
+export const MAX_DEPTH = 10;
 export const REQUEST_DELAY_MS = 350;
 
 const HEADERS = {

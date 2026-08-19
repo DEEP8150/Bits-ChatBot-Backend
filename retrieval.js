@@ -1,11 +1,16 @@
 import { pipeline } from "@xenova/transformers";
 import { cosineSimilarity, readStore } from "./knowledge-store.js";
 
-const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+const EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
+// BGE models are trained asymmetrically: queries should be prefixed with
+// this instruction, passages should NOT be (our stored chunk embeddings
+// aren't prefixed — see index-knowledge.js). This measurably improves
+// retrieval for BGE-family models; it's free, it's just prepended text.
+const QUERY_PREFIX = "Represent this sentence for searching relevant passages: ";
 const DEFAULT_MIN_SIMILARITY = 0.32;
 const TITLE_BOOST = 0.08;
 const SITE_BOOST = 0.03;
-const MAX_FROM_SOURCE = 2;
+const MAX_FROM_SOURCE = 4;
 let embedderPromise;
 
 async function getEmbedder() {
@@ -17,7 +22,7 @@ async function getEmbedder() {
 
 export async function embedQuery(text) {
   const embedder = await getEmbedder();
-  const output = await embedder(text, { pooling: "mean", normalize: true });
+  const output = await embedder(`${QUERY_PREFIX}${text}`, { pooling: "mean", normalize: true });
   return Array.from(output.data ?? output[0] ?? []);
 }
 
