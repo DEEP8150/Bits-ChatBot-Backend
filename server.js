@@ -171,14 +171,12 @@ app.post("/api/chat", async (req, res) => {
   if (!question.trim()) {
     return res.status(400).json({ error: "question is required" });
   }
-
   if (isGreeting(question)) {
     return res.json({
       answer: "Hello! I can help with BITS Pilani student welfare, scholarships, hostels, anti-ragging information, admissions, and related services.",
       sources: [],
     });
   }
-
   const retrieved = await retrieveChunks(question, { topK: MAX_CONTEXT_CHUNKS + 2, minSimilarity: MIN_RELEVANCE });
   const selected = retrieved.slice(0, MAX_CONTEXT_CHUNKS);
   const context = formatRetrievedContext(selected);
@@ -212,13 +210,6 @@ app.post("/api/chat", async (req, res) => {
   messages.push({ role: "user", content: question });
 
   try {
-    if (!selected.length) {
-      return res.json({
-        answer: "I couldn't find that in the available SWD information.",
-        sources: [],
-      });
-    }
-
     const response = await axios.post(
       LLAMACPP_URL,
       {
