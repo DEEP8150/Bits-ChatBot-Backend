@@ -1,8 +1,39 @@
-To Run Backend locally : 
+## Run the Project Locally
 
-Frontend: npm run dev -- --host
-Backend: npm run dev 
-Backend/tts: first activate piper virtual environment : .\piper-env\Scripts\Activate.ps1, then run : python -m piper.http_server -m en_US-lessac-medium --port 5001 .
-Run local LLM:  llama serve -hf bartowski/Qwen2.5-3B-Instruct-GGUF --port 8080
+### Frontend
 
-Text-To-Speech(TTS) and Speech-To-Text(STT) only works in localhost and not on any ip address.
+```bash
+npm run dev -- --host
+```
+
+### Backend
+
+```bash
+npm run dev
+```
+
+### Text-to-Speech Backend
+
+First, activate the Piper virtual environment:
+
+```powershell
+.\piper-env\Scripts\Activate.ps1
+```
+
+Then start the Piper HTTP server:
+
+```bash
+python -m piper.http_server -m en_US-lessac-medium --port 5001
+```
+
+### Run the Local LLM
+
+Start the local Qwen model using llama.cpp:
+
+```bash
+llama serve -hf bartowski/Qwen2.5-3B-Instruct-GGUF --port 8080
+```
+
+### Important
+
+> **Text-to-Speech (TTS) and Speech-to-Text (STT) currently work only on `localhost` and not when accessing the application through a local network IP address.**
