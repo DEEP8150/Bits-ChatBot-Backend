@@ -3,16 +3,16 @@ import * as cheerio from "cheerio";
 import https from "node:https";
 import { mkdir, writeFile } from "node:fs/promises";
 import { chromium } from "playwright";
-import { PDFParse } from "pdf-parse";
+import { CONFIG } from "./config.js";
 
 export const SITES = [
   { start: "https://swd.bits-pilani.ac.in/index.aspx", label: "SWD" },
   { start: "https://admissions.bits-pilani.ac.in/index.html", label: "Admissions" },
 ];
 
-export const MAX_PAGES_PER_SITE = 500;
-export const MAX_DEPTH = 10;
-export const REQUEST_DELAY_MS = 350;
+export const MAX_PAGES_PER_SITE = CONFIG.MAX_PAGES_PER_SITE;
+export const MAX_DEPTH = CONFIG.MAX_DEPTH;
+export const REQUEST_DELAY_MS = CONFIG.REQUEST_DELAY_MS;
 
 const HEADERS = {
   "User-Agent":
@@ -74,10 +74,42 @@ function cleanDom($) {
   $("[class*='tracking' i], [id*='tracking' i]").remove();
 }
 
-export function extractCleanText($) {
+// --- Section-aware extraction -------------------------------------------
+// Walks block-level elements in document order and groups text under the
+// nearest preceding heading. Falls back to one section with no heading if
+// the page has no headings at all.
+export function extractSections($) {
   cleanDom($);
   const root = $("main").length ? $("main") : $("body");
-  return normalize(root.text() || $("body").text() || "");
+  const sections = [];
+  let current = { heading: null, parts: [] };
+
+  root.find("h1, h2, h3, h4, h5, h6, p, li, td, blockquote").each((_, el) => {
+    const $el = $(el);
+    const tag = el.tagName ? el.tagName.toLowerCase() : "";
+    const text = normalize($el.text());
+    if (!text) return;
+
+    if (/^h[1-6]$/.test(tag)) {
+      if (current.parts.length) sections.push({ heading: current.heading, text: current.parts.join(" ") });
+      current = { heading: text, parts: [] };
+    } else {
+      current.parts.push(text);
+    }
+  });
+
+  if (current.parts.length) sections.push({ heading: current.heading, text: current.parts.join(" ") });
+
+  if (!sections.length) {
+    const fullText = normalize(root.text());
+    if (fullText) sections.push({ heading: null, text: fullText });
+  }
+
+  return sections;
+}
+
+export function extractCleanText($) {
+  return extractSections($).map((s) => s.text).join("\n\n");
 }
 
 export function extractPdfLinks($, baseUrl) {
@@ -127,6 +159,68 @@ async function fetchHtml(url) {
   return html;
 }
 
+// --- Sitemap / robots discovery ------------------------------------------
+async function discoverSitemapUrls(site, logger = console) {
+  const base = new URL(site.start);
+  const candidates = [`${base.origin}/sitemap.xml`, `${base.origin}/sitemap_index.xml`];
+  const discovered = new Set();
+
+  try {
+    const { data: robots } = await axios.get(`${base.origin}/robots.txt`, {
+      timeout: 10000,
+      headers: HEADERS,
+      httpsAgent: insecureAgent,
+    });
+    for (const match of robots.matchAll(/^Sitemap:\s*(\S+)/gim)) {
+      candidates.push(match[1]);
+    }
+  } catch {
+    /* no robots.txt, ignore */
+  }
+
+  for (const sitemapUrl of candidates) {
+    try {
+      const { data: xml } = await axios.get(sitemapUrl, {
+        timeout: 15000,
+        headers: HEADERS,
+        httpsAgent: insecureAgent,
+      });
+      const $ = cheerio.load(xml, { xmlMode: true });
+
+      const nestedSitemaps = [];
+      $("sitemap > loc").each((_, el) => nestedSitemaps.push($(el).text().trim()));
+      $("url > loc").each((_, el) => discovered.add($(el).text().trim()));
+
+      for (const nested of nestedSitemaps) {
+        try {
+          const { data: nestedXml } = await axios.get(nested, {
+            timeout: 15000,
+            headers: HEADERS,
+            httpsAgent: insecureAgent,
+          });
+          const $$ = cheerio.load(nestedXml, { xmlMode: true });
+          $$("url > loc").each((_, el) => discovered.add($$(el).text().trim()));
+        } catch {
+          /* skip broken nested sitemap */
+        }
+      }
+    } catch {
+      /* sitemap not found at this candidate url, try next */
+    }
+  }
+
+  const filtered = [...discovered].filter((url) => {
+    try {
+      return new URL(url).hostname === base.hostname;
+    } catch {
+      return false;
+    }
+  });
+
+  logger.log(`[${site.label}] Sitemap discovery found ${filtered.length} URLs`);
+  return filtered;
+}
+
 async function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({ headless: true });
@@ -134,18 +228,80 @@ async function getBrowser() {
   return browserPromise;
 }
 
+// --- Hidden content expansion (accordions/tabs/show-more) ----------------
+const DANGEROUS_TEXT_PATTERN = /log ?out|sign ?out|delete|remove|submit|pay|checkout|download|unsubscribe/i;
+const EXPAND_TEXT_PATTERN = /show more|load more|read more|view more|see more|expand/i;
+
+async function expandHiddenContent(page) {
+  try {
+    const detailsHandles = await page.$$("details:not([open])");
+    for (const handle of detailsHandles) {
+      try {
+        await handle.evaluate((el) => el.setAttribute("open", "true"));
+      } catch {
+        /* ignore individual failures */
+      }
+    }
+
+    const toggles = await page.$$('[aria-expanded="false"]');
+    for (const toggle of toggles) {
+      try {
+        const text = (await toggle.innerText().catch(() => "")) || "";
+        if (DANGEROUS_TEXT_PATTERN.test(text)) continue;
+        await toggle.click({ timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(150);
+      } catch {
+        /* ignore individual failures */
+      }
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const buttons = await page.$$("button, a[role=button], [role=tab]");
+      let clickedAny = false;
+      for (const button of buttons) {
+        try {
+          const text = (await button.innerText().catch(() => "")) || "";
+          if (!EXPAND_TEXT_PATTERN.test(text)) continue;
+          if (DANGEROUS_TEXT_PATTERN.test(text)) continue;
+          const typeAttr = await button.getAttribute("type").catch(() => null);
+          if (typeAttr === "submit") continue;
+          await button.click({ timeout: 2000 }).catch(() => {});
+          clickedAny = true;
+          await page.waitForTimeout(200);
+        } catch {
+          /* ignore individual failures */
+        }
+      }
+      if (!clickedAny) break;
+    }
+  } catch (err) {
+    console.warn(`Hidden-content expansion issue: ${err.message}`);
+  }
+}
+
 async function extractWithPlaywright(url) {
   const browser = await getBrowser();
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  // ignoreHTTPSErrors + matching User-Agent — same settings that already
+  // worked in the original crawler. This is the config that was likely
+  // missing when the Crawlee migration broke navigation.
+  const context = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    userAgent: HEADERS["User-Agent"],
+  });
   const page = await context.newPage();
   try {
-    await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(1000);
+    await page.setExtraHTTPHeaders({ "Accept-Language": HEADERS["Accept-Language"] });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.waitForSelector("main, article, [role='main'], body", { timeout: 8000 }).catch(() => {});
+    await expandHiddenContent(page);
+    await page.waitForTimeout(500);
     const html = await page.content();
     const $ = cheerio.load(html);
+    const sections = extractSections($);
     return {
       title: normalize(await page.title()) || url,
-      text: extractCleanText($),
+      text: sections.map((s) => s.text).join("\n\n"),
+      sections,
     };
   } finally {
     await page.close().catch(() => {});
@@ -171,7 +327,8 @@ async function extractPage(url) {
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
   const title = normalize($("title").first().text()) || url;
-  return { html, $, title, text: extractCleanText($) };
+  const sections = extractSections($);
+  return { html, $, title, text: sections.map((s) => s.text).join("\n\n"), sections };
 }
 
 async function crawlSite(site, logger = console) {
@@ -179,6 +336,7 @@ async function crawlSite(site, logger = console) {
   const queue = [{ url: site.start, depth: 0 }];
   const records = [];
   const pdfCandidates = new Map();
+  const rejectedPages = [];
   const stats = {
     htmlDiscovered: 0,
     htmlExtracted: 0,
@@ -189,7 +347,21 @@ async function crawlSite(site, logger = console) {
     pdfsDiscovered: 0,
     pdfsExtracted: 0,
     pdfsSkipped: 0,
+    sitemapUrls: 0,
   };
+
+  const sitemapUrls = await discoverSitemapUrls(site, logger);
+  stats.sitemapUrls = sitemapUrls.length;
+  for (const url of sitemapUrls) {
+    if (isPdfUrl(url)) {
+      if (!pdfCandidates.has(url)) {
+        pdfCandidates.set(url, { url, site: site.label, discoveredFrom: "sitemap" });
+        stats.pdfsDiscovered += 1;
+      }
+    } else {
+      queue.push({ url, depth: 0 });
+    }
+  }
 
   while (queue.length > 0 && visited.size < MAX_PAGES_PER_SITE) {
     const { url, depth } = queue.shift();
@@ -205,6 +377,7 @@ async function crawlSite(site, logger = console) {
       page = await extractPage(url);
     } catch (err) {
       stats.htmlSkipped += 1;
+      rejectedPages.push({ url, reason: `fetch failed: ${err.message}` });
       logger.warn(`Skipped page: ${err.message}`);
       continue;
     }
@@ -214,6 +387,8 @@ async function crawlSite(site, logger = console) {
 
     let finalText = page.text;
     let finalTitle = page.title;
+    let finalSections = page.sections;
+
     if (isUsefulContent(page.text)) {
       stats.axiosSuccesses += 1;
     } else {
@@ -222,6 +397,7 @@ async function crawlSite(site, logger = console) {
         const fallback = await extractWithPlaywright(url);
         finalText = fallback.text;
         finalTitle = fallback.title || finalTitle;
+        finalSections = fallback.sections;
         if (isUsefulContent(finalText)) {
           stats.playwrightSuccesses += 1;
           logger.log(`Playwright extracted: ${wordCount(finalText).toLocaleString()} words`);
@@ -243,11 +419,13 @@ async function crawlSite(site, logger = console) {
         title: finalTitle,
         sourceUrl: url,
         text: normalize(finalText),
+        sections: finalSections,
       });
       stats.htmlExtracted += 1;
       logger.log(`Saved page ✓`);
     } else {
       stats.htmlSkipped += 1;
+      rejectedPages.push({ url, reason: "no useful content", wordCount: wordCount(finalText) });
       logger.warn(`Skipped page: no useful content`);
     }
 
@@ -267,11 +445,11 @@ async function crawlSite(site, logger = console) {
     await sleep(REQUEST_DELAY_MS);
   }
 
-  return { records, pdfCandidates, stats };
+  return { records, pdfCandidates, stats, rejectedPages };
 }
 
+// --- PDF extraction with page-level text via pdfjs-dist -------------------
 async function extractPdf(url) {
-  let parser;
   try {
     const { data: buffer } = await axios.get(url, {
       responseType: "arraybuffer",
@@ -279,18 +457,29 @@ async function extractPdf(url) {
       headers: HEADERS,
       httpsAgent: insecureAgent,
     });
-    parser = new PDFParse({ data: buffer });
-    const result = await parser.getText();
-    return normalize(result.text);
-  } catch {
+
+    const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buffer), disableWorker: true });
+    const pdf = await loadingTask.promise;
+
+    const pages = [];
+    for (let i = 1; i <= pdf.numPages; i += 1) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      const text = normalize(content.items.map((item) => item.str).join(" "));
+      pages.push({ pageNumber: i, text });
+    }
+
+    return { text: normalize(pages.map((p) => p.text).join("\n\n")), pages };
+  } catch (err) {
+    console.warn(`PDF extraction failed for ${url}: ${err.message}`);
     return null;
-  } finally {
-    if (parser) await parser.destroy().catch(() => {});
   }
 }
 
 export async function runExtraction({ logger = console } = {}) {
   const allRecords = [];
+  const allRejectedPages = [];
   const summary = {
     htmlDiscovered: 0,
     htmlExtracted: 0,
@@ -301,14 +490,16 @@ export async function runExtraction({ logger = console } = {}) {
     pdfsDiscovered: 0,
     pdfsExtracted: 0,
     pdfsSkipped: 0,
+    sitemapUrls: 0,
     sites: {},
   };
   const pdfEntries = [];
 
   try {
     for (const site of SITES) {
-      const { records, pdfCandidates, stats } = await crawlSite(site, logger);
+      const { records, pdfCandidates, stats, rejectedPages } = await crawlSite(site, logger);
       allRecords.push(...records);
+      allRejectedPages.push(...rejectedPages.map((r) => ({ ...r, site: site.label })));
       pdfEntries.push(...pdfCandidates.values());
       summary.sites[site.label] = records.length;
       for (const [key, value] of Object.entries(stats)) {
@@ -320,8 +511,8 @@ export async function runExtraction({ logger = console } = {}) {
     for (const pdf of pdfEntries) {
       logger.log(`[${pdf.site}] PDF`);
       logger.log(`Fetching: ${pdf.url}`);
-      const text = await extractPdf(pdf.url);
-      if (text && isUsefulContent(text)) {
+      const result = await extractPdf(pdf.url);
+      if (result && isUsefulContent(result.text)) {
         allRecords.push({
           id: stableId(pdf.site, pdf.url),
           type: "pdf",
@@ -329,13 +520,15 @@ export async function runExtraction({ logger = console } = {}) {
           title: decodeURIComponent(pdf.url.split("/").pop() || pdf.url),
           sourceUrl: pdf.url,
           discoveredFrom: pdf.discoveredFrom,
-          text: normalize(text),
+          text: result.text,
+          pages: result.pages,
         });
         summary.pdfsExtracted += 1;
-        logger.log(`Extracted: ${wordCount(text).toLocaleString()} words`);
+        logger.log(`Extracted: ${wordCount(result.text).toLocaleString()} words across ${result.pages.length} pages`);
         logger.log(`Saved PDF ✓`);
       } else {
         summary.pdfsSkipped += 1;
+        allRejectedPages.push({ url: pdf.url, site: pdf.site, reason: "PDF unparseable or empty" });
         logger.warn(`Skipped PDF`);
       }
       await sleep(REQUEST_DELAY_MS);
@@ -344,8 +537,10 @@ export async function runExtraction({ logger = console } = {}) {
     await mkdir(".", { recursive: true });
     await writeFile("site-content.json", JSON.stringify(allRecords, null, 2), "utf8");
     await writeFile("site-content.txt", allRecords.map(pageTextToDebug).join("\n"), "utf8");
+    await writeFile("rejected-pages.json", JSON.stringify(allRejectedPages, null, 2), "utf8");
 
     logger.log(`\nExtraction complete`);
+    logger.log(`Sitemap URLs discovered: ${summary.sitemapUrls}`);
     logger.log(`HTML pages discovered: ${summary.htmlDiscovered}`);
     logger.log(`HTML pages successfully extracted: ${summary.htmlExtracted}`);
     logger.log(`HTML pages skipped: ${summary.htmlSkipped}`);
@@ -358,10 +553,11 @@ export async function runExtraction({ logger = console } = {}) {
     logger.log(`SWD records: ${summary.sites.SWD || 0}`);
     logger.log(`Admissions records: ${summary.sites.Admissions || 0}`);
     logger.log(`Total records: ${allRecords.length}`);
+    logger.log(`Rejected pages logged: ${allRejectedPages.length} (see rejected-pages.json)`);
     logger.log(`site-content.json written`);
     logger.log(`site-content.txt written`);
 
-    return { records: allRecords, summary };
+    return { records: allRecords, summary, rejectedPages: allRejectedPages };
   } finally {
     const browser = browserPromise ? await browserPromise.catch(() => null) : null;
     await browser?.close().catch(() => {});

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { formatRetrievedContext, retrieveChunks } from "./retrieval.js";
+import { CONFIG } from "./config.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +22,7 @@ const TEMP_CLEANUP_MS = 10 * 60 * 1000;
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_CONTEXT_CHUNKS = 6;
 const MIN_RELEVANCE = 0.32;
+const MIN_ANSWER_CONFIDENCE = 0.45;
 
 const app = express();
 app.use(cors());
@@ -177,8 +179,10 @@ app.post("/api/chat", async (req, res) => {
       sources: [],
     });
   }
+
   const retrieved = await retrieveChunks(question, { topK: MAX_CONTEXT_CHUNKS + 2, minSimilarity: MIN_RELEVANCE });
   const selected = retrieved.slice(0, MAX_CONTEXT_CHUNKS);
+  const confidence = retrieved.confidence || 0;
   const context = formatRetrievedContext(selected);
   const systemPrompt = await loadSystemPrompt();
   const historyText = buildHistoryText(history);
@@ -195,6 +199,18 @@ app.post("/api/chat", async (req, res) => {
     });
   }
 
+  if (!selected.length || confidence < MIN_ANSWER_CONFIDENCE) {
+    return res.json({
+      answer:
+        "I couldn't find that in the available SWD information. Please contact the Student Welfare Division for confirmation.",
+      sources: selected.map((chunk) => ({
+        title: chunk.title,
+        url: chunk.sourceUrl,
+        site: chunk.site,
+      })),
+    });
+  }
+
   const promptChars = systemPrompt.length + context.length + question.length + (historyText ? historyText.length : 0);
   console.log(`Prompt estimate: chunks=${selected.length}, contextChars=${context.length}, historyChars=${historyText.length}, totalChars=${promptChars}, approxTokens=${Math.ceil(promptChars / 4)}`);
 
@@ -205,7 +221,7 @@ app.post("/api/chat", async (req, res) => {
         .replace("{{RETRIEVED_CONTEXT}}", compressForBudget(context, 12000))
         .replace("{{CHAT_HISTORY}}", historyText ? compressForBudget(historyText, 4000) : "No previous messages."),
     },
-  ]
+  ];
 
   messages.push({ role: "user", content: question });
 
@@ -226,7 +242,7 @@ app.post("/api/chat", async (req, res) => {
       response.data?.response ||
       "";
 
-    const result = await synthesizeSpeech(answer);  
+    const result = await synthesizeSpeech(answer);
 
     return res.json({
       answer,

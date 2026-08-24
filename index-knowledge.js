@@ -3,23 +3,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pipeline, AutoTokenizer } from "@xenova/transformers";
 import { readStore, writeStore } from "./knowledge-store.js";
+import { CONFIG } from "./config.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SOURCE_FILE = path.join(__dirname, "site-content.json");
 const COLLECTION = "bits_swd_knowledge";
-// bge-small-en-v1.5: 512-token window (vs 256 for MiniLM), stronger on
-// retrieval benchmarks, still small/fast/free/local.
-const EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
+const EMBEDDING_MODEL = CONFIG.EMBEDDING_MODEL;
 
-// Target sizes are in TOKENS (of the embedding model's own tokenizer), not
-// words — this is what actually determines whether content gets truncated
-// before it's embedded. Kept well under the 512-token limit to leave margin
-// and to keep each chunk topically focused (better retrieval precision than
-// a small number of huge chunks).
-const TARGET_MAX_TOKENS = 220;
-const TARGET_MIN_TOKENS = 80;
-const OVERLAP_TOKENS = 40;
+const TARGET_MAX_TOKENS = CONFIG.TARGET_MAX_TOKENS;
+const TARGET_MIN_TOKENS = CONFIG.TARGET_MIN_TOKENS;
+const OVERLAP_TOKENS = CONFIG.OVERLAP_TOKENS;
 
 function splitIntoParagraphs(text) {
   return text
@@ -36,20 +30,33 @@ function splitLongParagraphIntoSentences(paragraph) {
     .filter(Boolean);
 }
 
-function buildChunks(record, tokenizer) {
-  const tokenCount = (text) => tokenizer.encode(text).length;
-  const paragraphs = splitIntoParagraphs(record.text);
+function buildPrefixedChunkText(recordTitle, bodyText, heading = null) {
+  const body = String(bodyText || "").trim();
+  if (!body) return "";
+
+  if (heading && String(heading).trim()) {
+    return `${recordTitle} — ${String(heading).trim()}\n${body}`;
+  }
+
+  return `${recordTitle}\n${body}`;
+}
+
+// Original greedy, token-aware chunking algorithm - unchanged logic, just
+// operating on a plain text blob so it can be reused per-page / per-section.
+function chunkPlainText(text, tokenizer) {
+  const tokenCount = (t) => tokenizer.encode(t).length;
+  const paragraphs = splitIntoParagraphs(text);
   const chunks = [];
   let current = [];
   let currentTokens = 0;
 
   const flush = () => {
-    const text = current.join("\n\n").trim();
-    if (text) chunks.push(text);
+    const chunkText = current.join("\n\n").trim();
+    if (chunkText) chunks.push(chunkText);
   };
 
-  const takeOverlapTail = (text) => {
-    const words = text.split(/\s+/);
+  const takeOverlapTail = (t) => {
+    const words = t.split(/\s+/);
     let tail = "";
     for (let i = words.length - 1; i >= 0; i -= 1) {
       const candidate = tail ? `${words[i]} ${tail}` : words[i];
@@ -61,9 +68,6 @@ function buildChunks(record, tokenizer) {
 
   for (const paragraph of paragraphs) {
     let pieces = [paragraph];
-    // If a single paragraph alone is already too big (common in PDF sections
-    // with no internal breaks), split it into sentence groups so nothing
-    // gets silently truncated by the embedder.
     if (tokenCount(paragraph) > TARGET_MAX_TOKENS) {
       const sentences = splitLongParagraphIntoSentences(paragraph);
       pieces = [];
@@ -108,6 +112,38 @@ function buildChunks(record, tokenizer) {
   return chunks;
 }
 
+// Decides chunk boundaries based on what structure the record has:
+// PDF -> never cross a page boundary. HTML -> prefer section boundaries.
+// Falls back to whole-record text if neither is available.
+function buildChunksForRecord(record, tokenizer) {
+  if (record.type === "pdf" && Array.isArray(record.pages) && record.pages.length) {
+    const results = [];
+    for (const page of record.pages) {
+      if (!page.text || !page.text.trim()) continue;
+      const pageHeading = page.heading || page.label || null;
+      const sourceText = pageHeading ? buildPrefixedChunkText(record.title, page.text, pageHeading) : page.text;
+      for (const text of chunkPlainText(sourceText, tokenizer)) {
+        results.push({ text, pageNumber: page.pageNumber, section: null });
+      }
+    }
+    if (results.length) return results;
+  }
+
+  if (Array.isArray(record.sections) && record.sections.length) {
+    const results = [];
+    for (const section of record.sections) {
+      if (!section.text || !section.text.trim()) continue;
+      const sourceText = buildPrefixedChunkText(record.title, section.text, section.heading);
+      for (const text of chunkPlainText(sourceText, tokenizer)) {
+        results.push({ text, pageNumber: null, section: section.heading });
+      }
+    }
+    if (results.length) return results;
+  }
+
+  return chunkPlainText(record.text, tokenizer).map((text) => ({ text, pageNumber: null, section: null }));
+}
+
 function chunkId(recordId, index) {
   return `${recordId}::chunk_${String(index + 1).padStart(3, "0")}`;
 }
@@ -126,21 +162,30 @@ async function main() {
 
   let totalChunks = 0;
   let oversizedChunks = 0;
+  let shortChunks = 0;
+  let totalTokens = 0;
+  let htmlChunks = 0;
+  let pdfChunks = 0;
+  let chunksWithSection = 0;
   const siteCounts = {};
 
   for (const record of records) {
-    const chunks = buildChunks(record, tokenizer);
-    siteCounts[record.site] = (siteCounts[record.site] || 0) + chunks.length;
+    const pieces = buildChunksForRecord(record, tokenizer);
+    siteCounts[record.site] = (siteCounts[record.site] || 0) + pieces.length;
 
-    for (let i = 0; i < chunks.length; i += 1) {
-      const text = chunks[i];
+    for (let i = 0; i < pieces.length; i += 1) {
+      const { text, pageNumber, section } = pieces[i];
       const tokenLength = tokenizer.encode(text).length;
-      if (tokenLength > 512) oversizedChunks += 1; // sanity check, should never fire
+      if (tokenLength > 512) {
+        oversizedChunks += 1;
+        console.warn(
+          `WARNING: final chunk exceeded 512 tokens after prefixing: record=${record.id} chunk=${i + 1} tokens=${tokenLength}`
+        );
+      }
+      if (tokenLength < 20) shortChunks += 1;
+      totalTokens += tokenLength;
 
-      // Prefix title/site into the EMBEDDING input only (not the stored/
-      // displayed text) — helps match queries like "Krishna Bhawan warden"
-      // against pages whose body text doesn't repeat the page name often.
-      const embeddingInput = `${record.title} — ${record.site}\n${text}`;
+      const embeddingInput = `${record.title}${section ? ` — ${section}` : ""} — ${record.site}\n${text}`;
       const output = await embedder(embeddingInput, { pooling: "mean", normalize: true });
       const embedding = Array.from(output.data ?? output[0] ?? []);
 
@@ -154,24 +199,39 @@ async function main() {
         discoveredFrom: record.discoveredFrom,
         chunkIndex: i,
         tokenLength,
+        pageNumber,
+        section,
         text,
         embedding,
       });
       totalChunks += 1;
+      if (record.type === "pdf") pdfChunks += 1;
+      else htmlChunks += 1;
+      if (section) chunksWithSection += 1;
     }
   }
 
   await writeStore(store);
+
   console.log(`Loaded ${records.length} source records`);
   console.log(`Generated ${totalChunks} chunks`);
   console.log(`Generated embeddings with ${EMBEDDING_MODEL}`);
   if (oversizedChunks > 0) {
-    console.warn(`WARNING: ${oversizedChunks} chunks exceeded 512 tokens — check buildChunks logic`);
+    console.warn(`WARNING: ${oversizedChunks} chunks exceeded 512 tokens after prefixing`);
   }
   console.log(`Stored ${totalChunks} chunks in local store: ${COLLECTION}`);
   for (const [site, count] of Object.entries(siteCounts)) {
     console.log(`${site} chunks: ${count}`);
   }
+
+  console.log(`\n=== Chunk quality summary ===`);
+  console.log(`HTML chunks: ${htmlChunks}`);
+  console.log(`PDF chunks: ${pdfChunks}`);
+  console.log(`Average chunk tokens: ${(totalTokens / Math.max(totalChunks, 1)).toFixed(1)}`);
+  console.log(
+    `Chunks with section metadata: ${chunksWithSection} (${((chunksWithSection / Math.max(totalChunks, 1)) * 100).toFixed(1)}%)`
+  );
+  console.log(`Suspiciously short chunks (<20 tokens): ${shortChunks}`);
 }
 
 main().catch((err) => {
